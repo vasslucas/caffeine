@@ -1,6 +1,4 @@
 import { useEffect, useRef, useState } from "react"
-import { BareMuxConnection } from "@mercuryworkshop/bare-mux"
-import type { ScramjetController } from "@mercuryworkshop/scramjet"
 
 type Tab = {
   id: string
@@ -211,46 +209,44 @@ function dataUrl(file: File): Promise<string> {
     reader.readAsDataURL(file)
   })
 }
-let proxyController: ScramjetController | undefined
-let proxyScript: Promise<void> | undefined
 let proxyInit: Promise<void> | undefined
 const asset = (path: string) => `${import.meta.env.BASE_URL}${path}`
-async function initializeProxy(wisp: string) {
+// caffeine's own proxy: a service worker that fetches pages through /p/ and rewrites HTML/CSS.
+export function encodeProxied(url: string) {
+  return `/p/${btoa(unescape(encodeURIComponent(url)))
+    .replace(/=+$/, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")}`
+}
+export function decodeProxied(href: string) {
+  const marker = "/p/"
+  const index = href.indexOf(marker)
+  if (index === -1) return ""
+  try {
+    return decodeURIComponent(
+      escape(
+        atob(
+          href
+            .slice(index + marker.length)
+            .split("?")[0]
+            .split("#")[0]
+            .replace(/-/g, "+")
+            .replace(/_/g, "/"),
+        ),
+      ),
+    )
+  } catch {
+    return ""
+  }
+}
+async function initializeProxy() {
   if (!window.isSecureContext || !navigator.serviceWorker)
     throw new Error(
-      "Scramjet needs HTTPS or localhost with service worker support.",
+      "The proxy needs HTTPS or localhost with service worker support.",
     )
-  if (!proxyScript)
-    proxyScript = new Promise((resolve, reject) => {
-      const script = document.createElement("script")
-      script.src = asset("scramjet/scramjet.all.js")
-      script.onload = () => resolve()
-      script.onerror = () => {
-        proxyScript = undefined
-        reject(new Error("Could not load Scramjet."))
-      }
-      document.head.appendChild(script)
-    })
-  await proxyScript
   if (!proxyInit)
     proxyInit = (async () => {
-      const factory = (window as unknown as {
-        $scramjetLoadController: () => {
-          ScramjetController: new (
-            config: object,
-          ) => ScramjetController
-        }
-      }).$scramjetLoadController()
-      proxyController = new factory.ScramjetController({
-        prefix: asset("service/"),
-        files: {
-          wasm: asset("scramjet/scramjet.wasm.wasm"),
-          all: asset("scramjet/scramjet.all.js"),
-          sync: asset("scramjet/scramjet.sync.js"),
-        },
-      })
-      await proxyController.init()
-      await navigator.serviceWorker.register(asset("proxy-sw.js"), {
+      await navigator.serviceWorker.register(asset("caffeine-proxy.js"), {
         scope: import.meta.env.BASE_URL,
       })
       await Promise.race([
@@ -287,21 +283,9 @@ async function initializeProxy(wisp: string) {
       throw error
     })
   await proxyInit
-  const connection = new BareMuxConnection(asset("bare-mux/worker.js"))
-  await connection.setManualTransport(`
-    const { default: Epoxy } = await import(${JSON.stringify(asset('epoxy/index.mjs'))});
-    class CaffeineTransport extends Epoxy {
-      init() {
-        if (!this.initialization) this.initialization = super.init().catch(error => { this.initialization = undefined; throw error; });
-        return this.initialization;
-      }
-    }
-    return [CaffeineTransport, "caffeine-epoxy"];
-  `, [{ wisp, wisp_v2: false }])
 }
 function proxyUrl(url: string) {
-  if (!proxyController) throw new Error("Proxy is not initialized.")
-  return proxyController.encodeUrl(url)
+  return encodeProxied(url)
 }
 function Icon({ name, size = 18 }: { name: string; size?: number }) {
   const paths: Record<string, React.ReactNode> = {
@@ -500,6 +484,7 @@ export default function App() {
   const [autoTranslate, setAutoTranslate] = useState(false)
   const [language, setLanguage] = useState("en")
   const [serverBundled, setServerBundled] = useState(false)
+  const [passwordRequired, setPasswordRequired] = useState(false)
   const [serverAccess, setServerAccess] = useState(false)
   const [serverPassword, setServerPassword] = useState("")
   const [remoteImages, setRemoteImages] = useState(true)
@@ -577,13 +562,13 @@ export default function App() {
     video,
   ])
   useEffect(() => {
-    if (!wisp || !profile || (serverBundled && !serverAccess && wisp.startsWith(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/`))) {
+    if (!profile) {
       setProxyReady(false)
       return
     }
     let cancelled = false
     setProxyReady(false)
-    initializeProxy(wisp)
+    initializeProxy()
       .then(() => {
         if (!cancelled) {
           setProxyReady(true)
@@ -599,12 +584,12 @@ export default function App() {
     return () => {
       cancelled = true
     }
-  }, [wisp, profile?.id, serverBundled, serverAccess])
+  }, [profile?.id])
   useEffect(() => {
     fetch(asset("api/runtime"))
       .then((response) => response.json())
       .then((data) => {
-        if (data.bundledWisp === true) { setServerBundled(true); setServerAccess(data.authenticated === true) }
+        if (data.bundledWisp === true) { setServerBundled(true); setPasswordRequired(data.authenticationRequired === true); setServerAccess(data.authenticated === true) }
       })
       .catch(() => {})
   }, [])
@@ -1029,9 +1014,11 @@ export default function App() {
     const href = frames.current[id]?.contentWindow?.location.href || ""
     if (!href) return ""
     try {
-      return href.includes(asset("service/"))
-        ? proxyController?.decodeUrl(href) || ""
-        : href
+      if (href.includes("/p/")) return decodeProxied(href) || href
+      // srcdoc frames keep their real URL on the injected base variable.
+      const base = (frames.current[id]?.contentWindow as unknown as { __CAFFEINE_BASE__?: string })?.__CAFFEINE_BASE__
+      if (base && /^https?:\/\//i.test(base)) return base
+      return href
     } catch {
       return ""
     }
@@ -1132,13 +1119,8 @@ export default function App() {
       })
       if (!response.ok) throw new Error()
       setServerPassword("")
-      setWisp(
-        `${
-          location.protocol === "https:" ? "wss" : "ws"
-        }://${location.host}/wisp/`,
-      )
       setServerAccess(true)
-      setError("Server access unlocked. Your same-site Wisp endpoint is ready.")
+      setError("Server access unlocked.")
     } catch {
       setError(
         "Could not unlock the bundled server. Check the server access password.",
@@ -1513,13 +1495,14 @@ export default function App() {
                     title={tab.title}
                     className={extensions.dark ? "dark-site" : ""}
                     allow="fullscreen; autoplay; clipboard-write"
+                    sandbox="allow-scripts allow-forms allow-popups allow-modals allow-downloads allow-same-origin"
                     onLoad={() => wireFrame(tab.id)}
                   />
                 ) : (
                   <div className="proxy-empty">
                     <Icon name="globe" size={38} />
                     <h2>Your next stop is ready.</h2>
-                    <p>Connect a Wisp server to browse with Scramjet.</p>
+                    <p>Browsing runs through caffeine's built-in proxy.</p>
                     <code>{tab.url}</code>
                     <button
                       className="primary-button"
@@ -1890,51 +1873,25 @@ export default function App() {
                   )}
                   {settingsPage === "Connection" && (
                     <>
-                      {serverBundled && <div className="bundled-connect"><strong>Wisp is included.</strong><p className="hint">This host runs the website and proxy together. Enter the server access password if the host requires one.</p><input type="password" className="text-input" placeholder="Server access password" value={serverPassword} onChange={event => setServerPassword(event.target.value)} autoComplete="off" /><button className="primary-button" onClick={connectBundled}>Use included server</button></div>}
                       <p className="hint">
-                        Scramjet rewrites websites through a service worker. A
-                        working Wisp WebSocket server is required. Use a server
-                        you operate or trust.
+                        Browsing runs through caffeine's own proxy: a service
+                        worker that fetches pages via /p/ and rewrites HTML, CSS
+                        and images so sites load inside the tab. No Wisp server,
+                        Scramjet or bare-mux is needed.
                       </p>
-                      <label className="field-label">Wisp endpoint</label>
-                      <form
-                        onSubmit={(event) => {
-                          event.preventDefault()
-                          const endpoint = new FormData(
-                            event.currentTarget,
-                          ).get("endpoint") as string
-                          try {
-                            const parsed = new URL(endpoint)
-                            if (!["ws:", "wss:"].includes(parsed.protocol))
-                              throw new Error()
-                            setWisp(endpoint)
-                          } catch {
-                            setError("Use a valid ws:// or wss:// endpoint.")
-                          }
-                        }}
-                      >
-                        <input
-                          className="text-input"
-                          name="endpoint"
-                          defaultValue={wisp}
-                          placeholder="wss://your-server.example/wisp/"
-                        />
-                        <button className="primary-button" type="submit">
-                          Connect <Icon name="forward" size={15} />
-                        </button>
-                      </form>
                       <p className="hint">
                         {proxyReady
-                          ? "Scramjet initialized. Sites use your configured endpoint."
-                          : "Not connected. Configure your endpoint to start browsing."}
+                          ? "Proxy active. Sites load through this host."
+                          : "Proxy starting… open a site or reload once the service worker activates."}
                       </p>
+                      {serverBundled && (passwordRequired || serverAccess) && <div className="bundled-connect"><strong>This host can require an access password.</strong><p className="hint">{serverAccess ? "Server access is unlocked for this browser session." : "Enter the server access password to unlock browsing on this host."}</p>{!serverAccess && <input type="password" className="text-input" placeholder="Server access password" value={serverPassword} onChange={event => setServerPassword(event.target.value)} autoComplete="off" />}{!serverAccess && <button className="primary-button" onClick={connectBundled}>Unlock server</button>}</div>}
                       <p className="hint">
                         The preview host may restrict service workers. Deploy to
                         HTTPS or localhost. Brand icons use an image proxy until
-                        Scramjet is connected.
+                        the proxy is connected.
                       </p>
-                      {toggle('Load remote images through a proxy', remoteImages, () => setRemoteImages(!remoteImages))}<p className="hint">No direct image fallback: connected browsing uses Scramjet; the bundled host uses its own /api/image endpoint; static previews use images.weserv.nl. Uploaded images stay local. Turning this off hides remote images.</p>
-                      <details className="hosting-guide"><summary>Host at caffeine.lucasvass.uk</summary><ol><li>Use a Node host such as a VPS, Railway, or Render, not static-only Pages.</li><li>Install with <code>pnpm install</code>, build with <code>pnpm build:host</code>, and start with <code>pnpm start</code>.</li><li>Set <code>HOST=0.0.0.0</code>, <code>NODE_ENV=production</code>, and a long <code>PROXY_PASSWORD</code>. Your host provides <code>PORT</code>.</li><li>Attach <code>caffeine.lucasvass.uk</code> to the host. Add the CNAME or A record it specifies in Cloudflare DNS and enable HTTPS.</li><li>In this connection panel, enter your server access password and choose “Use included server”. No separate Wisp server is needed.</li></ol><p>Cloudflare Pages can serve the frontend, but it still needs an external Wisp endpoint. A Worker needs a separate Wisp implementation using Cloudflare’s socket APIs; the included Node server cannot run unchanged in a Worker.</p><p>Use a dedicated subdomain rather than an iframe on your main site. Service worker registration is not reliable inside cross-site embeds. Your existing website can link to the subdomain.</p></details>
+                      {toggle('Load remote images through a proxy', remoteImages, () => setRemoteImages(!remoteImages))}<p className="hint">No direct image fallback: connected browsing uses the built-in proxy; the bundled host uses its own /api/image endpoint; static previews use images.weserv.nl. Uploaded images stay local. Turning this off hides remote images.</p>
+                      <details className="hosting-guide"><summary>Host at caffeine.lucasvass.uk</summary><ol><li>Use a Node host such as a VPS, Railway, or Render, not static-only Pages.</li><li>Install with <code>pnpm install</code>, build with <code>pnpm build:host</code>, and start with <code>pnpm start</code>.</li><li>Set <code>HOST=0.0.0.0</code>, <code>NODE_ENV=production</code>, and optionally a long <code>PROXY_PASSWORD</code>. Your host provides <code>PORT</code>.</li><li>Attach <code>caffeine.lucasvass.uk</code> to the host. Add the CNAME or A record it specifies in Cloudflare DNS and enable HTTPS.</li><li>No separate proxy server is needed — the included Node server also serves the /p/ proxy traffic used by the service worker.</li></ol><p>Cloudflare Pages can serve the frontend, but the /p/ proxy needs a real Node runtime (or a Worker rewrite), so a plain static host cannot browse for you.</p><p>Use a dedicated subdomain rather than an iframe on your main site. Service worker registration is not reliable inside cross-site embeds. Your existing website can link to the subdomain.</p></details>
                     </>
                   )}
                   {settingsPage === 'Passwords' && <>{toggle('Offer to save & autofill passwords', autofill, () => setAutofill(!autofill))}<p className="hint">Opt-in, best-effort support for conventional login forms. Saved credentials are AES-GCM encrypted locally with a key derived from your profile password/PIN. Incognito never saves or fills them. A long password is much safer than a short PIN.</p><p className="hint">A web proxy is not a hardened password manager. Do not store important or sensitive credentials here. Dynamic forms and translated pages may not support autofill.</p>{logins.map(login => <div className="list-row" key={login.id}><Icon name="shield" /><span>{login.host}<small className="login-username">{login.username}</small></span><Tool icon="close" label={`Delete login for ${login.host}`} onClick={() => removeLogin(login.id).catch(() => setError('Could not update vault.'))} /></div>)}{!logins.length && <p className="hint">No saved passwords.</p>}</>}
@@ -2085,7 +2042,7 @@ export default function App() {
           {profiles.length === 0 && <div className="onboarding-progress">{[0, 1, 2].map(step => <span className={onboardStep >= step ? 'filled' : ''} key={step} />)}<small>0{onboardStep + 1} / 03</small></div>}
           {(profiles.length > 0 || onboardStep === 0) && <div className="onboarding-step"><span className="eyebrow">YOUR SPACE STARTS HERE</span><h2>A browser that’s<br />a little more you.</h2>{profiles.length === 0 && <p className="official-proxy">crypted’s official proxy.</p>}<form onSubmit={event => { event.preventDefault(); if (profiles.length === 0) setOnboardStep(1); else createProfile() }}><div className="profile-avatar-upload"><label className="avatar-preview">{profileForm.avatar ? <img src={profileForm.avatar} alt="Your avatar" /> : <span>{profileForm.name[0] || '+'}</span>}<input type="file" accept="image/*" onChange={event => uploadSmall(event.target.files?.[0], 'avatar')} /></label><span>Pick a photo.<small>Or keep it simple.</small></span></div><label className="field-label">Your name<input className="text-input" required maxLength={32} value={profileForm.name} onChange={event => setProfileForm({ ...profileForm, name: event.target.value })} placeholder="What should we call you?" autoComplete="nickname" /></label><label className="field-label">Profile password or PIN<input className="text-input" type="password" required minLength={4} maxLength={128} value={profileForm.pin} onChange={event => setProfileForm({ ...profileForm, pin: event.target.value })} placeholder="At least 4 characters" autoComplete="new-password" /></label><p className="hint">Local to this browser. No cloud account or password recovery. Use a long password for stronger protection.</p><button className="primary-button onboarding-next" disabled={busy}>{busy ? 'Creating…' : profiles.length ? 'Create profile' : 'Make it mine'}<Icon name="forward" size={16} /></button></form></div>}
           {profiles.length === 0 && onboardStep === 1 && <div className="onboarding-step"><span className="eyebrow">SET THE SCENE</span><h2>Your own little<br />escape.</h2><p className="hint">Start with a view. Everything can change later.</p><div className="wallpaper-grid onboarding-wallpapers">{wallpapers.map(item => <button key={item.name} className={`wallpaper-choice ${wallpaper === item.url && !video ? 'chosen' : ''}`} style={{ backgroundImage: item.url ? `url(${remoteImage(item.url)})` : undefined }} onClick={() => { setWallpaper(item.url); setVideo('') }}><span>{item.name}</span>{wallpaper === item.url && !video && <Icon name="check" size={17} />}</button>)}</div><label className="upload-button"><Icon name="image" size={16} />Or upload your own<input type="file" accept="image/*,video/mp4,video/webm" onChange={event => upload(event.target.files?.[0])} /></label><p className="section-caption">A signature color</p><div className="accent-colors">{['#b8a2ef', '#a1c5ff', '#9bd6b2', '#f0bd9c', '#f39cba'].map(color => <button style={{ background: color }} className={color === accent ? 'selected' : ''} key={color} aria-label={`Accent ${color}`} onClick={() => setAccent(color)}>{accent === color && <Icon name="check" size={16} />}</button>)}</div><div className="onboarding-buttons"><button className="quiet-button" onClick={() => setOnboardStep(0)}>Back</button><button className="primary-button" onClick={() => setOnboardStep(2)}>Looks like me<Icon name="forward" size={16} /></button></div></div>}
-          {profiles.length === 0 && onboardStep === 2 && <div className="onboarding-step"><span className="eyebrow">ONE LAST THING</span><h2>Your internet.<br />Your rules.</h2><p className="hint">The canvas works immediately. Browsing needs a Wisp connection.</p>{serverBundled ? <div className="setup-included"><Icon name="shield" size={25} /><div><strong>Wisp is already included.</strong><p>This host runs the proxy too. Unlock server access in Settings → Connection after setup.</p></div></div> : <><label className="field-label">Wisp URL · optional<input className="text-input" value={wisp} onChange={event => setWisp(event.target.value)} placeholder="wss://your-server.example/wisp/" /></label><p className="hint">No server yet? Skip this. Hosting instructions and an included Node + Wisp server are ready in Settings → Connection.</p></>}{toggle('Block ads & trackers', extensions.blocker, () => setExtensions({ ...extensions, blocker: !extensions.blocker }))}{toggle('Custom home cursor', home.cursor, () => setHome({ ...home, cursor: !home.cursor }))}<div className="onboarding-buttons"><button className="quiet-button" onClick={() => setOnboardStep(1)}>Back</button><button className="primary-button" disabled={busy} onClick={createProfile}>{busy ? 'Creating your space…' : 'Let’s go'}<Icon name="forward" size={16} /></button></div></div>}
+          {profiles.length === 0 && onboardStep === 2 && <div className="onboarding-step"><span className="eyebrow">ONE LAST THING</span><h2>Your internet.<br />Your rules.</h2><p className="hint">The canvas works immediately. Browsing runs through caffeine's built-in proxy as soon as your profile opens.</p>{serverBundled ? <div className="setup-included"><Icon name="shield" size={25} /><div><strong>Proxy is already included.</strong><p>This host serves the /p/ proxy directly — no separate Wisp server needed.</p></div></div> : <p className="hint">Hosting instructions are ready in Settings → Connection.</p>}{toggle('Block ads & trackers', extensions.blocker, () => setExtensions({ ...extensions, blocker: !extensions.blocker }))}{toggle('Custom home cursor', home.cursor, () => setHome({ ...home, cursor: !home.cursor }))}<div className="onboarding-buttons"><button className="quiet-button" onClick={() => setOnboardStep(1)}>Back</button><button className="primary-button" disabled={busy} onClick={createProfile}>{busy ? 'Creating your space…' : 'Let’s go'}<Icon name="forward" size={16} /></button></div></div>}
         </> : <div className="onboarding-step"><span className="eyebrow">YOUR LOCAL PROFILES</span><h2>{profile ? 'Make yourself at home.' : 'Welcome back.'}</h2><p className="hint">Separate layouts, bookmarks, history and encrypted vaults. Website cookies remain shared on this proxy origin.</p><div className="profile-list">{profiles.map(item => <button className={`profile-card ${unlockId === item.id ? 'chosen' : ''}`} key={item.id} onClick={() => { if (profile?.id === item.id) setPanel(''); else { setUnlockId(item.id); setUnlockPin('') } }}><span className="avatar-preview">{item.avatar ? <img src={item.avatar} alt="" /> : item.name[0]}</span><span>{item.name}<small>{profile?.id === item.id ? 'Current profile' : 'Unlock to enter'}</small></span><Icon name={profile?.id === item.id ? 'check' : 'forward'} size={16} /></button>)}</div>{unlockId && <form className="profile-unlock" onSubmit={event => { event.preventDefault(); unlockProfile() }}><input className="text-input" type="password" autoFocus value={unlockPin} onChange={event => setUnlockPin(event.target.value)} placeholder="Profile password or PIN" required autoComplete="current-password" /><button className="primary-button" disabled={busy}>{busy ? 'Unlocking…' : 'Unlock'}<Icon name="forward" size={15} /></button></form>}<div className="editor-actions"><button onClick={() => { setProfileForm({ name: '', pin: '', avatar: '' }); setPanel('newprofile') }}>+ New profile</button>{profile && <button onClick={lockProfile}>Lock profile</button>}</div><p className="hint">Profiles are local conveniences, not isolated Chrome accounts. Keep this site on its own subdomain.</p></div>}
       </section></div>}
     </div>
