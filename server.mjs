@@ -9,7 +9,9 @@ const host = process.env.HOST || '127.0.0.1'
 const port = Number(process.env.PORT || 8080)
 const password = process.env.PROXY_PASSWORD || ''
 const publicHost = process.env.NODE_ENV === 'production' || !['127.0.0.1', 'localhost', '::1'].includes(host)
-if (publicHost && password.length < 12) throw new Error('Set PROXY_PASSWORD to at least 12 characters before exposing this server to the internet.')
+if (publicHost && password.length < 12) {
+  console.error('[caffeine] WARNING: PROXY_PASSWORD is missing or shorter than 12 characters while this server is exposed publicly. Set PROXY_PASSWORD (>=12 chars) in your Railway service variables. The server will stay up, but every page request requires a valid access cookie, so nothing is reachable until you set it.')
+}
 const sessionSecret = randomBytes(32)
 const signature = value => createHmac('sha256', sessionSecret).update(value).digest('base64url')
 const equal = (first, second) => { const left = Buffer.from(first); const right = Buffer.from(second); return left.length === right.length && timingSafeEqual(left, right) }
