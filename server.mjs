@@ -5,7 +5,13 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { server as wisp } from '@mercuryworkshop/wisp-js/server'
 
 const root = resolve('dist')
-const host = process.env.HOST || process.env.HOSTNAME || '127.0.0.1'
+// On PaaS hosts (Railway, Fly, Render) the container interface is private; always bind to all interfaces there.
+// Prefer explicit HOST, but treat a hostname that isn't loopback as "we're in a container" and bind 0.0.0.0.
+const requestedHost = process.env.HOST || ''
+const localOnly = ['127.0.0.1', 'localhost', '::1']
+const host = requestedHost ? (localOnly.includes(requestedHost) ? requestedHost : '0.0.0.0')
+  : (process.env.RAILWAY_ENVIRONMENT_NAME || process.env.FLY_APP_NAME || process.env.RENDER || process.env.DYNO || process.env.KOYEB_APP_ID) ? '0.0.0.0'
+  : (process.env.HOSTNAME && !localOnly.includes(process.env.HOSTNAME) ? '0.0.0.0' : '127.0.0.1')
 const port = Number(process.env.PORT || 8080)
 const password = process.env.PROXY_PASSWORD || ''
 const publicHost = process.env.NODE_ENV === 'production' || !['127.0.0.1', 'localhost', '::1'].includes(host)
