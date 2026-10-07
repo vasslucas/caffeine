@@ -5,7 +5,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { server as wisp } from '@mercuryworkshop/wisp-js/server'
 
 const root = resolve('dist')
-const host = process.env.HOST || '127.0.0.1'
+const host = process.env.HOST || process.env.HOSTNAME || '127.0.0.1'
 const port = Number(process.env.PORT || 8080)
 const password = process.env.PROXY_PASSWORD || ''
 const publicHost = process.env.NODE_ENV === 'production' || !['127.0.0.1', 'localhost', '::1'].includes(host)
