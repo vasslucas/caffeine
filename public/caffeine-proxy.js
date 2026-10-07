@@ -51,6 +51,13 @@ function rewriteHtml(source, base) {
   if (/<head(\s[^>]*)?>/i.test(html)) html = html.replace(/<head(\s[^>]*)?>/i, all => all + injected)
   else if (/<html(\s[^>]*)?>/i.test(html)) html = html.replace(/<html(\s[^>]*)?>/i, all => all + '<head>' + injected + '</head>')
   else html = injected + html
+  // Nested frame guard: proxied HTML is wrapped in a srcdoc iframe, but sites also ship their own iframes
+  // whose src points back at /p/. Those inner frames re-run rewriteHtml and wrap themselves again, so every
+  // search or navigation stacks another copy of caffeine's viewer inside the previous one ("opens inside itself").
+  // When this document is already running inside a caffeine wrapper, render the page content directly instead.
+  const unwrap = `<script>(()=>{try{if(window.top===window.parent)return;var d=document;if(!d.querySelector('base[href^="/p/"]'))return;d.querySelectorAll('iframe[srcdoc]').forEach(f=>f.remove());var b=d.querySelector('base[href^="/p/"]');if(b)b.remove();if(d.body)d.body.style.height='auto';d.documentElement.style.height='auto'}catch(e){}})();<\/script>`
+  const closing = /<\/body>/i.exec(html)
+  html = closing ? html.slice(0, closing.index) + unwrap + html.slice(closing.index) : html + unwrap
   return `<!doctype html><html><head><meta charset="utf-8"><base href="${rewritten}"><style>html,body{margin:0;height:100%;background:#fff}</style></head><body style="height:100vh"><iframe id="__caffeine_frame" srcdoc="${html.replace(/&/g, '&amp;').replace(/"/g, '&quot;')}" style="width:100%;height:100%;border:0;color-scheme:light dark" sandbox="allow-scripts allow-forms allow-popups allow-modals allow-downloads allow-same-origin"></iframe></body></html>`
 }
 
