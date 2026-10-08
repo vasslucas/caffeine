@@ -1,2 +1,4 @@
 # Build artifacts
-dist/
+dist/node_modules/
+patches/
+caffeine-fixes.patch
