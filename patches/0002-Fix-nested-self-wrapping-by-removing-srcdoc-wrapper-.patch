@@ -1,0 +1,75 @@
+From bdc217bd99cfc8d5f37e4d6fd3fb38033b150b07 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Wed, 7 Oct 2026 22:15:02 +0000
+Subject: [PATCH 2/3] Fix nested self-wrapping by removing srcdoc wrapper from
+ proxy entirely
+
+The previous fix (unwrap guard) did not work because the guard script was
+inside the srcdoc iframe document, which has no <base href="/p/..."> tag, so
+its detection condition never matched and every proxied page kept re-wrapping
+itself in a nested viewer iframe.
+
+rewriteHtml now serves one flat proxied document: it keeps the site's own
+<head> (title/meta/styles/scripts), injects <base href="/p/..."> plus helper
+scripts, strips the outer html/body wrappers, blanks any iframe whose src
+points back at /p/, and appends a corrected unwrap guard that detects genuine
+stale old-format responses (body>iframe#__caffeine_frame[srcdoc] + /p/ base
+tag) and recovers their content. Rebuilt dist.
+---
+ dist/index.html          |  4 ++--
+ public/caffeine-proxy.js | 24 +++++++++++++-----------
+ 2 files changed, 15 insertions(+), 13 deletions(-)
+
+diff --git a/dist/index.html b/dist/index.html
+index 4c30da6..6bd8d07 100644
+--- a/dist/index.html
++++ b/dist/index.html
+@@ -7,8 +7,8 @@
+     <title>Figma Make App</title>
+     
+     <meta property="og:title" content="Figma Make App">
+-    <script type="module" crossorigin src="/assets/index-Yca4aMd3.js"></script>
+-    <link rel="stylesheet" crossorigin href="/assets/index-BLyDY0YV.css">
++    <script type="module" crossorigin src="/assets/index-DkClI5Xg.js"></script>
++    <link rel="stylesheet" crossorigin href="/assets/index-CwzjBfYw.css">
+   </head>
+   <body>
+     
+diff --git a/public/caffeine-proxy.js b/public/caffeine-proxy.js
+index 10256a3..3f57a32 100644
+--- a/public/caffeine-proxy.js
++++ b/public/caffeine-proxy.js
+@@ -48,17 +48,19 @@ function rewriteHtml(source, base) {
+   html = html.replace(/(<link\b[^>]*?)(rel=(["'])stylesheet\3[^>]*>)/i, (all, before, after) => `${before}crossorigin="anonymous" ${after}`)
+   const rewritten = enc(base)
+   const injected = `<script>window.__CAFFEINE_BASE__=${JSON.stringify(base)};window.__caffeineResolve=u=>{try{return new URL(u,window.__CAFFEINE_BASE__).href}catch{return u}};window.__caffeineProxied=u=>'/p/'+btoa(unescape(encodeURIComponent(window.__caffeineResolve(u)))).replace(/=+$/,'').replace(/\\+/g,'-').replace(/\\//g,'_');<\/script>`
+-  if (/<head(\s[^>]*)?>/i.test(html)) html = html.replace(/<head(\s[^>]*)?>/i, all => all + injected)
+-  else if (/<html(\s[^>]*)?>/i.test(html)) html = html.replace(/<html(\s[^>]*)?>/i, all => all + '<head>' + injected + '</head>')
+-  else html = injected + html
+-  // Nested frame guard: proxied HTML is wrapped in a srcdoc iframe, but sites also ship their own iframes
+-  // whose src points back at /p/. Those inner frames re-run rewriteHtml and wrap themselves again, so every
+-  // search or navigation stacks another copy of caffeine's viewer inside the previous one ("opens inside itself").
+-  // When this document is already running inside a caffeine wrapper, render the page content directly instead.
+-  const unwrap = `<script>(()=>{try{if(window.top===window.parent)return;var d=document;if(!d.querySelector('base[href^="/p/"]'))return;d.querySelectorAll('iframe[srcdoc]').forEach(f=>f.remove());var b=d.querySelector('base[href^="/p/"]');if(b)b.remove();if(d.body)d.body.style.height='auto';d.documentElement.style.height='auto'}catch(e){}})();<\/script>`
+-  const closing = /<\/body>/i.exec(html)
+-  html = closing ? html.slice(0, closing.index) + unwrap + html.slice(closing.index) : html + unwrap
+-  return `<!doctype html><html><head><meta charset="utf-8"><base href="${rewritten}"><style>html,body{margin:0;height:100%;background:#fff}</style></head><body style="height:100vh"><iframe id="__caffeine_frame" srcdoc="${html.replace(/&/g, '&amp;').replace(/"/g, '&quot;')}" style="width:100%;height:100%;border:0;color-scheme:light dark" sandbox="allow-scripts allow-forms allow-popups allow-modals allow-downloads allow-same-origin"></iframe></body></html>`
++  const baseTag = `<base href="${rewritten}">`
++  if (/<head(\s[^>]*)?>/i.test(html)) html = html.replace(/<head(\s[^>]*)?>/i, all => all + baseTag + injected)
++  else if (/<html(\s[^>]*)?>/i.test(html)) html = html.replace(/<html(\s[^>]*)?>/i, all => all + '<head>' + baseTag + injected + '</head>')
++  else html = '<head>' + baseTag + injected + '</head>' + html
++  // Guard against self-nesting: if a stale cached copy of this worker still serves the old "wrapper"
++  // format (a page wrapped in an iframe#__caffeine_frame with a /p/ base tag), unwrap it back to flat HTML.
++  const unwrap = `<script>(()=>{try{var f=document.querySelector('body>iframe#__caffeine_frame[srcdoc]');var b=document.querySelector('base[href^="/p/"]');if(f&&b){b.remove();document.body.innerHTML=f.getAttribute('srcdoc')}else{document.querySelectorAll('iframe[src^="/p/"]').forEach(x=>x.setAttribute('src','about:blank'))}}catch(e){}})();<\/script>`
++  // Keep the source <head> (title, meta, styles, scripts); drop the outer html/body wrappers so we can
++  // close them ourselves, and neutralize any nested caffeine wrapper documents inside site iframes.
++  let bodyContent = html.replace(/<!doctype[^>]*>/i, '').replace(/^[\s\S]*?<html(\s[^>]*)?>/i, '')
++  bodyContent = bodyContent.replace(/<iframe\b[^>]*\bsrc=(["'])\/p\/[^"']*\1/gi, (all, quote) => all.replace(new RegExp('src=' + quote + '[^' + quote + ']*' + quote), 'src="about:blank"'))
++  bodyContent = bodyContent.replace(/<\/?body(\s[^>]*)?>/gi, '')
++  return `<!doctype html><html lang="en">${bodyContent}${unwrap}</body></html>`
+ }
+ 
+ function rewriteCss(source, base) {
+-- 
+2.39.5
+
